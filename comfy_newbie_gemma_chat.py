@@ -4,7 +4,7 @@ Enables chat/text generation using the Gemma model loaded in NewBie CLIP.
 """
 
 import torch
-from typing import Tuple, Any, Optional
+from typing import Tuple
 
 try:
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -46,8 +46,26 @@ class NewBieGemmaChat:
     """
     Chat with the Gemma model that's used in NewBie CLIP.
     This node loads a separate instance of Gemma for text generation.
+    Supports both NewBie CLIP Loader and ComfyUI DualCLIPLoader (type="newbie").
     """
-    
+
+    def _detect_clip_type(self, clip):
+        """
+        Detect CLIP object type.
+        Returns: "newbie_clip" | "comfyui_dual_clip" | "unknown"
+        """
+        # NewBie CLIP Loader: has text_encoder + tokenizer with name_or_path
+        has_text_encoder = hasattr(clip, 'text_encoder') and hasattr(clip, 'tokenizer')
+        if has_text_encoder and hasattr(clip.tokenizer, 'name_or_path'):
+            return "newbie_clip"
+
+        # ComfyUI DualCLIPLoader (type="newbie"): has cond_stage_model.gemma + tokenizer.gemma
+        has_cond_stage = hasattr(clip, 'cond_stage_model') and hasattr(clip, 'tokenizer')
+        if has_cond_stage and hasattr(clip.cond_stage_model, 'gemma') and hasattr(clip.tokenizer, 'gemma'):
+            return "comfyui_dual_clip"
+
+        return "unknown"
+
     default_sys_prompt = """
 You are a Danbooru-to-XML prompt converter for AI image generation.
 
@@ -107,7 +125,7 @@ XML FORMAT:
         return {
             "required": {
                 "clip": ("CLIP", {
-                    "tooltip": "NewBie CLIP model - used to get the Gemma model path"
+                    "tooltip": "CLIP model from NewBie CLIP Loader or ComfyUI DualCLIPLoader (type=newbie)"
                 }),
                 "user_message": ("STRING", {
                     "multiline": True,
@@ -116,6 +134,10 @@ XML FORMAT:
                 }),
             },
             "optional": {
+                "gemma_model_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Gemma model path (required for ComfyUI DualCLIPLoader, e.g. google/gemma-3-4b-it)"
+                }),
                 "system_prompt": ("STRING", {
                     "multiline": True,
                     "default": "You are a helpful AI assistant.",
@@ -167,29 +189,74 @@ XML FORMAT:
     FUNCTION = "chat"
     CATEGORY = "NewBie/LLM"
     TITLE = "NewBie Gemma Chat"
-    DESCRIPTION = "Chat with the Gemma model using the same model loaded in NewBie CLIP. Supports system prompt, temperature, and multi-turn conversations."
+    DESCRIPTION = "Chat with the Gemma model. Supports both NewBie CLIP Loader and ComfyUI DualCLIPLoader (type=newbie)."
 
-    def _get_gemma_model_info(self, clip):
-        """Extract Gemma model path and settings from the CLIP object"""
-        # The tokenizer in NewBieCLIP contains info about where it was loaded from
-        if hasattr(clip, 'tokenizer') and hasattr(clip.tokenizer, 'name_or_path'):
-            model_path = clip.tokenizer.name_or_path
-        elif hasattr(clip, 'text_encoder') and hasattr(clip.text_encoder, 'name_or_path'):
-            model_path = clip.text_encoder.name_or_path
-        elif hasattr(clip, 'text_encoder') and hasattr(clip.text_encoder.config, '_name_or_path'):
-            model_path = clip.text_encoder.config._name_or_path
-        else:
-            raise ValueError("Cannot determine Gemma model path from CLIP. Make sure you're using NewBie CLIP Loader.")
-        
-        device = clip.device if hasattr(clip, 'device') else "cuda"
-        
-        # Get dtype from text_encoder
-        if hasattr(clip, 'text_encoder'):
-            dtype = next(clip.text_encoder.parameters()).dtype
-        else:
-            dtype = torch.bfloat16
-            
+    def _get_gemma_model_info(self, clip, gemma_model_path: str = ""):
+        """Extract Gemma model path and settings from the CLIP object."""
+        clip_type = self._detect_clip_type(clip)
+        model_path = self._resolve_model_path(clip, clip_type, gemma_model_path)
+        device = self._get_device(clip)
+        dtype = self._get_dtype(clip, clip_type)
         return model_path, device, dtype
+
+    def _resolve_model_path(self, clip, clip_type: str, gemma_model_path: str) -> str:
+        """Resolve the Gemma model path based on clip type and user input."""
+        # User-specified path takes priority
+        if gemma_model_path and gemma_model_path.strip():
+            model_path = gemma_model_path.strip()
+            print(f"[NewBie Gemma Chat] Using user-specified model path: {model_path}")
+            return model_path
+
+        if clip_type == "newbie_clip":
+            model_path = self._extract_newbie_clip_path(clip)
+            print(f"[NewBie Gemma Chat] Detected: NewBie CLIP mode")
+            return model_path
+
+        if clip_type == "comfyui_dual_clip":
+            raise ValueError(
+                "ComfyUI DualCLIPLoader detected but gemma_model_path is empty.\n"
+                "Please provide the Gemma generation model path (e.g., google/gemma-3-4b-it or local path).\n"
+                "Note: The encoder model in DualCLIPLoader cannot be used for text generation."
+            )
+
+        raise ValueError(
+            "Unknown CLIP type. Please use:\n"
+            "1. NewBie CLIP Loader, or\n"
+            "2. ComfyUI DualCLIPLoader (type=newbie) with gemma_model_path specified"
+        )
+
+    def _extract_newbie_clip_path(self, clip) -> str:
+        """Extract model path from NewBie CLIP object."""
+        # Try tokenizer.name_or_path first
+        if hasattr(clip, 'tokenizer') and hasattr(clip.tokenizer, 'name_or_path'):
+            return clip.tokenizer.name_or_path
+
+        # Try text_encoder.name_or_path
+        if hasattr(clip, 'text_encoder'):
+            if hasattr(clip.text_encoder, 'name_or_path'):
+                return clip.text_encoder.name_or_path
+            if hasattr(clip.text_encoder, 'config') and hasattr(clip.text_encoder.config, '_name_or_path'):
+                return clip.text_encoder.config._name_or_path
+
+        raise ValueError("Cannot determine Gemma model path from NewBie CLIP.")
+
+    def _get_device(self, clip) -> str:
+        """Determine the device to use for the model."""
+        if hasattr(clip, 'device'):
+            return clip.device
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
+    def _get_dtype(self, clip, clip_type: str) -> torch.dtype:
+        """Determine the dtype to use for the model."""
+        if clip_type == "newbie_clip" and hasattr(clip, 'text_encoder'):
+            return next(clip.text_encoder.parameters()).dtype
+
+        if clip_type == "comfyui_dual_clip" and hasattr(clip, 'cond_stage_model'):
+            gemma = getattr(clip.cond_stage_model, 'gemma', None)
+            if gemma is not None and hasattr(gemma, 'dtype'):
+                return gemma.dtype
+
+        return torch.bfloat16
 
     def _load_generation_model(self, model_path: str, device: str, dtype: torch.dtype):
         """Load or retrieve cached Gemma model for generation"""
@@ -320,10 +387,70 @@ XML FORMAT:
         result += "<start_of_turn>model\n"
         return result
 
+    def _build_generation_config(
+        self,
+        tokenizer,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        do_sample: bool = True,
+        repetition_penalty: float = 1.0,
+    ) -> dict:
+        """Build generation configuration dictionary."""
+        use_sampling = do_sample and temperature > 0
+        config = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": use_sampling,
+            "pad_token_id": tokenizer.eos_token_id,
+        }
+
+        if repetition_penalty != 1.0:
+            config["repetition_penalty"] = repetition_penalty
+
+        if use_sampling:
+            config["temperature"] = temperature
+            config["top_p"] = top_p
+            if top_k > 0:
+                config["top_k"] = top_k
+
+        return config
+
+    def _generate_response(
+        self,
+        model,
+        tokenizer,
+        prompt: str,
+        device: str,
+        generation_config: dict,
+    ) -> str:
+        """Generate and decode response from the model."""
+        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(**inputs, **generation_config)
+
+        generated_tokens = outputs[0][inputs['input_ids'].shape[1]:]
+        response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        return response.replace("<end_of_turn>", "").strip()
+
+    def _build_conversation_history(
+        self,
+        user_message: str,
+        response: str,
+        conversation_history: str,
+    ) -> str:
+        """Build the full conversation history string."""
+        new_exchange = f"USER: {user_message.strip()}\nASSISTANT: {response}"
+        if conversation_history and conversation_history.strip():
+            return f"{conversation_history.strip()}\n{new_exchange}"
+        return new_exchange
+
     def chat(
         self,
         clip,
         user_message: str,
+        gemma_model_path: str = "",
         system_prompt: str = "You are a helpful AI assistant.",
         temperature: float = 0.7,
         max_new_tokens: int = 512,
@@ -332,68 +459,30 @@ XML FORMAT:
         conversation_history: str = "",
         unload_after: bool = True,
     ) -> Tuple[str, str]:
-        """Generate a chat response from Gemma"""
-        
-        if not hasattr(clip, 'text_encoder') or not hasattr(clip, 'tokenizer'):
-            raise ValueError("This node requires a NewBie CLIP model loaded with NewBie CLIP Loader")
-        
+        """Generate a chat response from Gemma."""
         if not user_message or not user_message.strip():
-            return ("Please provide a message.", conversation_history)
-        
-        # Get model info and load generation model
-        model_path, device, dtype = self._get_gemma_model_info(clip)
+            return "Please provide a message.", conversation_history
+
+        model_path, device, dtype = self._get_gemma_model_info(clip, gemma_model_path)
         model, tokenizer = self._load_generation_model(model_path, device, dtype)
-        
-        # Format messages
+
         messages = self._format_messages(system_prompt, user_message, conversation_history)
-        
-        # Apply chat template
         prompt = self._apply_chat_template(tokenizer, messages)
-        
+
         print(f"[NewBie Gemma Chat] Generating response...")
         print(f"[NewBie Gemma Chat] Temperature: {temperature}, Max tokens: {max_new_tokens}")
-        
-        # Tokenize
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        
-        # Generate
-        with torch.no_grad():
-            generation_config = {
-                "max_new_tokens": max_new_tokens,
-                "do_sample": temperature > 0,
-                "pad_token_id": tokenizer.eos_token_id,
-            }
-            
-            if temperature > 0:
-                generation_config["temperature"] = temperature
-                generation_config["top_p"] = top_p
-                if top_k > 0:
-                    generation_config["top_k"] = top_k
-            
-            outputs = model.generate(
-                **inputs,
-                **generation_config
-            )
-        
-        # Decode response
-        generated_tokens = outputs[0][inputs['input_ids'].shape[1]:]
-        response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        
-        # Clean up response (remove any trailing turn markers)
-        response = response.replace("<end_of_turn>", "").strip()
-        
-        # Build full conversation history for chaining
-        if conversation_history and conversation_history.strip():
-            full_conversation = f"{conversation_history.strip()}\nUSER: {user_message.strip()}\nASSISTANT: {response}"
-        else:
-            full_conversation = f"USER: {user_message.strip()}\nASSISTANT: {response}"
-        
+
+        generation_config = self._build_generation_config(
+            tokenizer, max_new_tokens, temperature, top_p, top_k
+        )
+        response = self._generate_response(model, tokenizer, prompt, device, generation_config)
+        full_conversation = self._build_conversation_history(user_message, response, conversation_history)
+
         print(f"[NewBie Gemma Chat] Response generated ({len(response)} chars)")
-        
-        # Clear VRAM if requested
+
         if unload_after:
             _clear_gemma_cache()
-        
+
         return (response, full_conversation)
 
 
@@ -401,12 +490,11 @@ class NewBieGemmaChatAdvanced(NewBieGemmaChat):
     """
     Advanced Gemma Chat with more generation parameters and optional model override.
     """
-    
+
     @classmethod
     def INPUT_TYPES(cls):
         base_inputs = super().INPUT_TYPES()
-        
-        # Add advanced options
+
         base_inputs["optional"]["repetition_penalty"] = ("FLOAT", {
             "default": 1.0,
             "min": 1.0,
@@ -424,16 +512,24 @@ class NewBieGemmaChatAdvanced(NewBieGemmaChat):
             "max": 2**31-1,
             "tooltip": "Random seed for reproducibility (-1=random)"
         })
-        
+
         return base_inputs
-    
+
     TITLE = "NewBie Gemma Chat (Advanced)"
-    DESCRIPTION = "Advanced Gemma chat with additional generation parameters."
+    DESCRIPTION = "Advanced Gemma chat with additional generation parameters. Supports both NewBie CLIP Loader and ComfyUI DualCLIPLoader."
+
+    def _set_seed(self, seed: int) -> None:
+        """Set random seed for reproducibility."""
+        if seed >= 0:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
 
     def chat(
         self,
         clip,
         user_message: str,
+        gemma_model_path: str = "",
         system_prompt: str = "You are a helpful AI assistant.",
         temperature: float = 0.7,
         max_new_tokens: int = 512,
@@ -445,75 +541,33 @@ class NewBieGemmaChatAdvanced(NewBieGemmaChat):
         do_sample: bool = True,
         seed: int = -1,
     ) -> Tuple[str, str]:
-        """Generate a chat response from Gemma with advanced options"""
-        
-        if not hasattr(clip, 'text_encoder') or not hasattr(clip, 'tokenizer'):
-            raise ValueError("This node requires a NewBie CLIP model loaded with NewBie CLIP Loader")
-        
+        """Generate a chat response from Gemma with advanced options."""
         if not user_message or not user_message.strip():
-            return ("Please provide a message.", conversation_history)
-        
-        # Set seed if specified
-        if seed >= 0:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-        
-        # Get model info and load generation model
-        model_path, device, dtype = self._get_gemma_model_info(clip)
+            return "Please provide a message.", conversation_history
+
+        self._set_seed(seed)
+
+        model_path, device, dtype = self._get_gemma_model_info(clip, gemma_model_path)
         model, tokenizer = self._load_generation_model(model_path, device, dtype)
-        
-        # Format messages
+
         messages = self._format_messages(system_prompt, user_message, conversation_history)
-        
-        # Apply chat template
         prompt = self._apply_chat_template(tokenizer, messages)
-        
+
         print(f"[NewBie Gemma Chat Advanced] Generating response...")
         print(f"[NewBie Gemma Chat Advanced] Temperature: {temperature}, Max tokens: {max_new_tokens}, Seed: {seed}")
-        
-        # Tokenize
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
-        
-        # Generate with advanced options
-        with torch.no_grad():
-            generation_config = {
-                "max_new_tokens": max_new_tokens,
-                "do_sample": do_sample and temperature > 0,
-                "pad_token_id": tokenizer.eos_token_id,
-                "repetition_penalty": repetition_penalty,
-            }
-            
-            if do_sample and temperature > 0:
-                generation_config["temperature"] = temperature
-                generation_config["top_p"] = top_p
-                if top_k > 0:
-                    generation_config["top_k"] = top_k
-            
-            outputs = model.generate(
-                **inputs,
-                **generation_config
-            )
-        
-        # Decode response
-        generated_tokens = outputs[0][inputs['input_ids'].shape[1]:]
-        response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        
-        # Clean up response
-        response = response.replace("<end_of_turn>", "").strip()
-        
-        # Build full conversation history
-        if conversation_history and conversation_history.strip():
-            full_conversation = f"{conversation_history.strip()}\nUSER: {user_message.strip()}\nASSISTANT: {response}"
-        else:
-            full_conversation = f"USER: {user_message.strip()}\nASSISTANT: {response}"
-        
+
+        generation_config = self._build_generation_config(
+            tokenizer, max_new_tokens, temperature, top_p, top_k,
+            do_sample=do_sample, repetition_penalty=repetition_penalty
+        )
+        response = self._generate_response(model, tokenizer, prompt, device, generation_config)
+        full_conversation = self._build_conversation_history(user_message, response, conversation_history)
+
         print(f"[NewBie Gemma Chat Advanced] Response generated ({len(response)} chars)")
-        
-        # Clear VRAM if requested
+
         if unload_after:
             _clear_gemma_cache()
-        
+
         return (response, full_conversation)
 
 
