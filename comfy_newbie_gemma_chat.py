@@ -433,8 +433,10 @@ class NewBieGemmaChat:
         num_layers = len(model.layers)
         kv_cache: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * num_layers
 
-        # EOS tokens
-        eos_tokens = {1, 107}  # <eos> 和 <end_of_turn>
+        # EOS tokens - 只用真正的 EOS token
+        # 注意：107 是 <end_of_turn> 但在某些情况下可能误触发
+        # Gemma special tokens: BOS=2, EOS=1, PAD=0
+        eos_tokens = {1}  # 只用 <eos>
 
         with torch.no_grad():
             # ==================== Phase 1: Prefill ====================
