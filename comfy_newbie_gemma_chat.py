@@ -191,7 +191,10 @@ class NewBieGemmaChat:
             freqs_cis: RoPE frequencies (可能是 tuple for Gemma3)
         """
         if not COMFY_ROPE_AVAILABLE:
-            raise ImportError("precompute_freqs_cis not available from ComfyUI")
+            raise RuntimeError(
+                "All-in-One mode requires ComfyUI's precompute_freqs_cis. "
+                "Please install ComfyUI or use external model mode (use_clip_model=False)."
+            )
 
         config = model.config
         return precompute_freqs_cis(
