@@ -1,0 +1,12 @@
+# PR #2 单元测试依赖
+
+# 核心测试框架
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-mock>=3.11.1
+
+# PyTorch (假设主项目已安装，如果没有请手动安装)
+# torch>=2.0.0
+
+# 可选: 并行执行
+# pytest-xdist>=3.3.1
