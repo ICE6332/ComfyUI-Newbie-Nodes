@@ -210,7 +210,6 @@ def test_new_feature_basic_case(self, mock_model):
 
 - [pytest 文档](https://docs.pytest.org/)
 - [pytest-cov 文档](https://pytest-cov.readthedocs.io/)
-- [PR #2 Implementation Plan](../docs/pr2-implementation-plan.md)
 
 ## 联系方式
 
